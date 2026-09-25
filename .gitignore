@@ -1,0 +1,8 @@
+# 本地直接 make 时产生的编译现场（CI 在全新机器上编，不受影响）
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+modules.order
+.tmp_versions/

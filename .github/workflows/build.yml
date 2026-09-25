@@ -1,0 +1,122 @@
+# lyz_drv.ko 云编译 —— GitHub Actions 工作流
+#
+# 放在仓库根目录的 .github/workflows/build.yml 才会生效。
+# 触发：Actions 页 → Run workflow（手动），或 push 到 main 自动触发。
+# 产物：run 详情页底部 Artifacts → lyz_drv-ko.zip（lyz_drv.ko + vmlinux.symvers）
+#
+# 流程 = 本机 WSL 已验证的那套（BUILD.md / setup_opd2.sh / rebuild_opd.sh）原样上云：
+#   拼工作区 → device.config + 安全瘦身集 → 完整 make vmlinux（CRC 唯一来源）
+#   → vmlinux.symvers 补拷为 Module.symvers → 走本仓库 Makefile 编 lyz_drv.ko
+
+name: Build lyz_drv.ko
+
+on:
+  push:
+    branches: [ main ]        # push 即自动编译；不想要就删掉这两行
+  workflow_dispatch: {}       # 手动触发（网页上的 Run workflow 按钮）
+
+# 连续 push 时只保留最新一次，旧 run 自动取消（省时间）
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 分支名 = 本机 dl_mtk.sh / dl_mod.sh 实测所用（OnePlusOSS 两仓同分支）
+  TREE_BRANCH: oneplus/mt6897_v_15.0.0_oneplus_pad
+  KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_mt6897
+  MODULES_REPO: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897
+  # clang r487747c (17.0.2) = 设备内核同款工具链（BUILD.md §5 A 路 URL）
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-clang-r487747c/clang-r487747c.tar.gz
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04     # 与本机 WSL(22.04) 对齐；若该镜像将来下线，改 ubuntu-latest 即可
+    steps:
+      # 1. 把本仓库（驱动源码 + device.config）检出到 runner
+      - name: 1. 检出本仓库
+        uses: actions/checkout@v4
+
+      # 2. runner 是全新机器，什么都不带 —— 内核构建依赖现装
+      - name: 2. 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flex bison bc libssl-dev libelf-dev xz-utils cpio
+
+      # 3. clang r487747c（约 1GB，runner 网络直连 googlesource 很快）
+      - name: 3. 下载 clang r487747c
+        run: |
+          wget -q -O clang.tar.gz "$CLANG_URL"
+          mkdir -p "$HOME/tc/clang-r487747c"
+          tar -xf clang.tar.gz -C "$HOME/tc/clang-r487747c"
+          # 写进 GITHUB_ENV —— 每个 run 步骤是独立 shell，这样后续步骤 PATH 自动带上
+          echo "PATH=$HOME/tc/clang-r487747c/bin:$PATH" >> "$GITHUB_ENV"
+          "$HOME/tc/clang-r487747c/bin/clang" --version
+
+      # 4. 拼 OnePlus 工作区：模块仓就是骨架（kernel/ + vendor/），内核仓塞进 kernel-6.1 槽位。
+      #    内核树里 9 个符号链接（kernel/oplus_cpu、mm/mm-trace.h、drivers/soc/oplus/* 等）
+      #    指向 vendor/oplus/...，不拼模块仓树编不起来。
+      #    全程 Linux ext4 + git 原生 clone —— 本机 Windows 中转的"四雷"一颗都没有。
+      - name: 4. 拉取内核树 + 配套模块仓
+        run: |
+          git clone --depth=1 --branch "$TREE_BRANCH" "$MODULES_REPO" ws
+          rm -rf ws/kernel/kernel-6.1                       # 清掉占位槽位
+          git clone --depth=1 --branch "$TREE_BRANCH" "$KERNEL_REPO" ws/kernel/kernel-6.1
+          rm -rf ws/.git ws/kernel/kernel-6.1/.git          # 省磁盘
+          echo "== 断链审计（必须为 0）=="
+          n=$(find ws/kernel/kernel-6.1 -xtype l ! -path "*/out/*" | wc -l)
+          if [ "$n" -ne 0 ]; then
+            echo "[FAIL] $n 个断链"; find ws/kernel/kernel-6.1 -xtype l | head; exit 1
+          fi
+          head -5 ws/kernel/kernel-6.1/Makefile             # 版本对账：应见 VERSION=6.1
+
+      # 5. 配置树：device.config（设备 /proc/config.gz 真配置）+ 安全瘦身集（全部不进 ABI）
+      #    以后要跑 BTF 对账（struct_diff），把 -d DEBUG_INFO* 三个开关删掉重跑即可
+      - name: 5. 配置内核树
+        run: |
+          TREE="$PWD/ws/kernel/kernel-6.1"
+          mkdir -p "$TREE/out"
+          cp device.config "$TREE/out/.config"
+          cd "$TREE"
+          ./scripts/config --file out/.config \
+            -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE \
+            -d PGO_CLANG \
+            -d TRIM_UNUSED_KSYMS --set-str UNUSED_KSYMS_WHITELIST "" \
+            -d DEBUG_INFO -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES \
+            --set-str SYSTEM_TRUSTED_KEYS "" \
+            --set-str SYSTEM_REVOCATION_KEYS "" \
+            --set-str MODULE_SIG_KEY "certs/signing_key.pem"
+          make ARCH=arm64 LLVM=1 O=out olddefconfig
+          grep -E "CONFIG_(LTO_NONE|LTO_CLANG_THIN|DEBUG_INFO_BTF|MODULE_SIG_FORCE)=" out/.config || true
+          echo "MTK/OPLUS 配置存活数: $(grep -cE '^CONFIG_(MTK|OPLUS)' out/.config)"
+
+      # 6. 完整编 vmlinux —— vmlinux.symvers 是模块 CRC 的唯一来源，
+      #    modules_prepare 代替不了（BUILD.md §0.3 铁律）。4 核 runner 约 30~50 分钟。
+      - name: 6. 编译 vmlinux
+        run: |
+          cd ws/kernel/kernel-6.1
+          make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" vmlinux
+          wc -l out/vmlinux.symvers
+          echo "-- module_layout（设备真值 0xea759d7f，开源树预期 0xa26bedb1）--"
+          grep -w module_layout out/vmlinux.symvers || true
+
+      # 7. 编 lyz_drv.ko —— 走本仓库自带的 Makefile：
+      #    它就是 "make -C 内核树 M=本目录 modules" 的包装器（已带 ARCH=arm64 LLVM=1）
+      - name: 7. 编译 lyz_drv.ko
+        run: |
+          TREE="$PWD/ws/kernel/kernel-6.1"
+          # 6.1 坑：vmlinux-only 构建的 symvers 叫 vmlinux.symvers，
+          # 外部模块编译按 Module.symvers 名字找输入 —— 补一份拷贝（同源无害）
+          if [ ! -f "$TREE/out/Module.symvers" ]; then
+            cp "$TREE/out/vmlinux.symvers" "$TREE/out/Module.symvers"
+          fi
+          make KDIR="$TREE" KOUT="$TREE/out" -j"$(nproc)"
+          modinfo lyz_drv.ko | grep -E '^(version|vermagic|depends):'
+
+      # 8. 产物传回 GitHub 网页 —— runner 跑完即销毁，不传就没了（Artifacts 默认留 90 天）
+      - name: 8. 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: lyz_drv-ko
+          path: |
+            lyz_drv.ko
+            ws/kernel/kernel-6.1/out/vmlinux.symvers

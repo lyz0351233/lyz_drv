@@ -1,0 +1,3 @@
+# 全仓库强制 LF：防止 Windows 端 git(autocrlf) 把 device.config / 脚本 / 源码
+# 转成 CRLF —— kconfig 词法器对 \r 零容忍（BUILD.md §4.1 的雷）
+* text=auto eol=lf
