@@ -26,9 +26,19 @@ env:
   KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_mt6897
   MODULES_REPO: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897
   # clang r487747c (17.0.2) = 设备内核同款工具链（android14-6.1 GKI 的 CLANG_VERSION 同款）。
-  # 注意：旧的 master-clang-r487747c 分支已被谷歌删除（实测 404），
-  # 现走 A14 发布 tag 里的归档（r1/r2/r3/r5 实测均 200，这里取 r2）。
-  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-14.0.0_r2/clang-r487747c.tar.gz
+  # 下载路线（2026-09 实测定稿，别走回头路）：
+  #   a) googlesource 的 +archive 现场打包流撑不完 ~700MB 的包（长流中途必被掐）→ tarball 直下废弃；
+  #   b) 旧的 master-clang-r487747c 分支已被谷歌删除（404），正源只剩 tag + git 协议；
+  #   c) 主路 = GitHub 镜像整克隆（runner↔GitHub 同源网络最稳）。halogenOS 镜像已与
+  #      googlesource 正源做过全量 blob 哈希对账：7396 个文件里 7395 个逐字节一致，
+  #      唯一差异是 lib/libncurses.so.6（宿主 TUI 库，不影响编译内核）；
+  #   d) 兜底 = googlesource tag 部分克隆 + 稀疏检出（git 智能协议，实测可行）。
+  CLANG_MIRROR: https://github.com/halogenOS/android_prebuilts_clang_host_linux-x86_clang-r487747c
+  CLANG_CANONICAL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+  CLANG_TAG: android-14.0.0_r2
+  # 防篡改抽查基准（googlesource 正源的 git blob 哈希）：bin/clang 包装器 + bin/clang-17 真编译器
+  CLANG_H_WRAP: 1c2542d2c8b8c797be8d0820c22d74f0264f3663
+  CLANG_H_REAL: 77f333c6a3d939e208c15967a6fcadef3f18d409
 
 jobs:
   build:
@@ -45,18 +55,41 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y flex bison bc libssl-dev libelf-dev xz-utils cpio
 
-      # 3. clang r487747c（约 1GB，runner 网络直连 googlesource 很快）
+      # 3. clang r487747c（镜像 543MB pack + ~1.5GB 检出，runner↔GitHub 极快）
       - name: 3. 下载 clang r487747c
         run: |
-          # --retry-on-http-error：googlesource 的 +archive 是现场打包，偶发 503；wget 默认不重试 5xx
-          wget -q --tries=3 --retry-on-http-error -O clang.tar.gz "$CLANG_URL"
-          mkdir -p "$HOME/tc/clang-r487747c"
-          tar -xf clang.tar.gz -C "$HOME/tc/clang-r487747c"
-          # 归档内容 = clang-r487747c/ 目录本体（bin/ lib/ ...），解压完必须能直接看到 bin/clang
-          test -x "$HOME/tc/clang-r487747c/bin/clang" || { echo "[FAIL] 解压后没有 bin/clang，归档结构变了"; ls "$HOME/tc/clang-r487747c" | head; exit 1; }
+          TC="$HOME/tc/clang-r487747c"
+          mkdir -p "$HOME/tc"
+          # --- 主路：GitHub 镜像仓（根目录即 clang-r487747c/ 本体）---
+          if git clone --depth=1 "$CLANG_MIRROR" tc-clang; then
+            # 防篡改抽查：与 googlesource 正源哈希对账（rev-parse 纯树查询，不花流量）
+            h1=$(git -C tc-clang rev-parse HEAD:bin/clang)
+            h2=$(git -C tc-clang rev-parse HEAD:bin/clang-17)
+            echo "镜像 blob: bin/clang=$h1  bin/clang-17=$h2"
+            if [ "$h1" != "$CLANG_H_WRAP" ] || [ "$h2" != "$CLANG_H_REAL" ]; then
+              echo "::warning::镜像哈希与正源不一致，弃用镜像，转兜底路线"
+              rm -rf tc-clang
+            else
+              rm -rf tc-clang/.git
+              mv tc-clang "$TC"
+            fi
+          fi
+          # --- 兜底：googlesource tag + 部分克隆稀疏检出（git 协议 ≠ +archive 生成器）---
+          if [ ! -x "$TC/bin/clang" ]; then
+            echo "== 主路未成，改走 googlesource 部分克隆 =="
+            rm -rf tc-clang tc-repo "$TC"
+            git clone --depth=1 --branch "$CLANG_TAG" --filter=blob:none --no-checkout "$CLANG_CANONICAL" tc-repo
+            git -C tc-repo sparse-checkout set clang-r487747c
+            git -C tc-repo checkout
+            mv tc-repo/clang-r487747c "$TC"
+            rm -rf tc-repo
+          fi
+          # --- 统一验收：结构 + 版本身份 ---
+          test -x "$TC/bin/clang" || { echo "[FAIL] 两条路都没拿到 bin/clang"; exit 1; }
+          grep -q "r487747c" "$TC/AndroidVersion.txt" || { echo "[FAIL] AndroidVersion.txt 里没有 r487747c，版本拿错了"; cat "$TC/AndroidVersion.txt"; exit 1; }
           # 写进 GITHUB_ENV —— 每个 run 步骤是独立 shell，这样后续步骤 PATH 自动带上
-          echo "PATH=$HOME/tc/clang-r487747c/bin:$PATH" >> "$GITHUB_ENV"
-          "$HOME/tc/clang-r487747c/bin/clang" --version
+          echo "PATH=$TC/bin:$PATH" >> "$GITHUB_ENV"
+          "$TC/bin/clang" --version
 
       # 4. 拼 OnePlus 工作区：模块仓就是骨架（kernel/ + vendor/），内核仓塞进 kernel-6.1 槽位。
       #    内核树里 9 个符号链接（kernel/oplus_cpu、mm/mm-trace.h、drivers/soc/oplus/* 等）
