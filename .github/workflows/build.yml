@@ -128,13 +128,21 @@ jobs:
           grep -E "CONFIG_(LTO_NONE|LTO_CLANG_THIN|DEBUG_INFO_BTF|MODULE_SIG_FORCE)=" out/.config || true
           echo "MTK/OPLUS 配置存活数: $(grep -cE '^CONFIG_(MTK|OPLUS)' out/.config)"
 
-      # 6. 完整编 vmlinux —— vmlinux.symvers 是模块 CRC 的唯一来源，
-      #    modules_prepare 代替不了（BUILD.md §0.3 铁律）。4 核 runner 约 30~50 分钟。
+      # 6. 完整编 vmlinux + modules_prepare —— 外部模块构建的两块基石，缺一不可：
+      #    · vmlinux         → vmlinux.symvers（模块 CRC 唯一来源，§0.3 铁律）
+      #    · modules_prepare → out/scripts/module.lds（.ko 链接的 -T 脚本，由 module.lds.S
+      #      预处理而来）。树顶层 Makefile 明写：modules_prepare: prepare; $(build)=scripts scripts/module.lds
+      #    纯 vmlinux 构建只下降进 scripts/mod（自己的 modpost），不进 scripts/ 顶层——
+      #    漏了 modules_prepare，ld .ko 时就报『No rule to make target scripts/module.lds』
+      #    （本机 WSL 没炸纯属 out/ 有旧实验残留；干净树必炸，CI 第三跑亲证）。
+      #    4 核 runner：vmlinux 约 30~50 分钟，modules_prepare 增量几十秒。
       - name: 6. 编译 vmlinux
         run: |
           cd ws/kernel/kernel-6.1
           make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" vmlinux
+          make ARCH=arm64 LLVM=1 O=out modules_prepare
           wc -l out/vmlinux.symvers
+          test -f out/scripts/module.lds || { echo "[FAIL] modules_prepare 之后仍没有 out/scripts/module.lds"; exit 1; }
           echo "-- module_layout（设备真值 0xea759d7f，开源树预期 0xa26bedb1）--"
           grep -w module_layout out/vmlinux.symvers || true
 
