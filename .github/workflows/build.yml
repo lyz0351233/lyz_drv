@@ -25,16 +25,19 @@ env:
   TREE_BRANCH: oneplus/mt6897_v_15.0.0_oneplus_pad
   KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_mt6897
   MODULES_REPO: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897
-  # clang r487747c (17.0.2) = 设备内核同款工具链（BUILD.md §5 A 路 URL）
-  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-clang-r487747c/clang-r487747c.tar.gz
+  # clang r487747c (17.0.2) = 设备内核同款工具链（android14-6.1 GKI 的 CLANG_VERSION 同款）。
+  # 注意：旧的 master-clang-r487747c 分支已被谷歌删除（实测 404），
+  # 现走 A14 发布 tag 里的归档（r1/r2/r3/r5 实测均 200，这里取 r2）。
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-14.0.0_r2/clang-r487747c.tar.gz
 
 jobs:
   build:
     runs-on: ubuntu-22.04     # 与本机 WSL(22.04) 对齐；若该镜像将来下线，改 ubuntu-latest 即可
     steps:
       # 1. 把本仓库（驱动源码 + device.config）检出到 runner
+      #    checkout@v5 = node24 运行时（v4 会吃 Node 20 弃用警告）
       - name: 1. 检出本仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 2. runner 是全新机器，什么都不带 —— 内核构建依赖现装
       - name: 2. 安装构建依赖
@@ -45,9 +48,12 @@ jobs:
       # 3. clang r487747c（约 1GB，runner 网络直连 googlesource 很快）
       - name: 3. 下载 clang r487747c
         run: |
-          wget -q -O clang.tar.gz "$CLANG_URL"
+          # --retry-on-http-error：googlesource 的 +archive 是现场打包，偶发 503；wget 默认不重试 5xx
+          wget -q --tries=3 --retry-on-http-error -O clang.tar.gz "$CLANG_URL"
           mkdir -p "$HOME/tc/clang-r487747c"
           tar -xf clang.tar.gz -C "$HOME/tc/clang-r487747c"
+          # 归档内容 = clang-r487747c/ 目录本体（bin/ lib/ ...），解压完必须能直接看到 bin/clang
+          test -x "$HOME/tc/clang-r487747c/bin/clang" || { echo "[FAIL] 解压后没有 bin/clang，归档结构变了"; ls "$HOME/tc/clang-r487747c" | head; exit 1; }
           # 写进 GITHUB_ENV —— 每个 run 步骤是独立 shell，这样后续步骤 PATH 自动带上
           echo "PATH=$HOME/tc/clang-r487747c/bin:$PATH" >> "$GITHUB_ENV"
           "$HOME/tc/clang-r487747c/bin/clang" --version
@@ -113,8 +119,9 @@ jobs:
           modinfo lyz_drv.ko | grep -E '^(version|vermagic|depends):'
 
       # 8. 产物传回 GitHub 网页 —— runner 跑完即销毁，不传就没了（Artifacts 默认留 90 天）
+      #    upload-artifact@v6 = node24 运行时（注意 v5 及更早仍是 node20）
       - name: 8. 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: lyz_drv-ko
           path: |
